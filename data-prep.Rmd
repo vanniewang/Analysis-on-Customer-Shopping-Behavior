@@ -1,0 +1,169 @@
+---
+title: "Data preparation"
+output:
+  pdf_document: default
+---
+
+# Instructions
+
+- You only need to submit the .Rmd of this file, not a PDF.
+
+- You should __comment__ your code clearly to show what you've done to prepare the data.
+
+- The purpose of this file is to use the data in the `data-raw` folder to create the data you will use in the report. The data you will use in the report should be saved in the `data` folder. It is good professional practice to make sure you're never directly modifying your raw data, but instead creating new datasets based on merges/manipulations that you need to reuse.
+
+- Make sure you've taken a look at the hints for the web scraping and census API. 
+
+- You may find the `write_rds()` function from the `readr` package helpful (it is loaded as part of the `tidyverse`).
+
+- You do not need to keep the structure below.
+
+# Set up
+
+```{r, libraries}
+# Set up any libraries you need
+library(tidyverse)
+library(polite)
+library(rvest)
+library(cancensus)
+library(haven)
+library(lubridate)
+```
+
+# Loading client data
+
+```{r}
+cust_dev = read_rds("data-raw/cust_dev.Rds")
+customer = read_rds("data-raw/customer.Rds")
+cust_sleep = read_rds("data-raw/cust_sleep.Rds")
+device = read_rds("data-raw/device.Rds")
+```
+
+
+
+## Web scraping industry data
+
+```{r}
+## add url in here
+url <- "https://fitnesstrackerinfohub.netlify.app/."
+
+# Make sure this code is updated appropriately to provide 
+# informative user_agent details
+target <- bow(url,
+              user_agent = "meiyi.wu@utoronto.ca for STA303/1002 project",
+              force = TRUE)
+
+# Any details provided in the robots text on crawl delays and 
+# which agents are allowed to scrape
+target
+
+html <- scrape(target)
+
+device_data <- html %>% 
+  html_elements("table") %>% 
+  html_table() %>% 
+  pluck(1) # added, in case you're getting a list format
+```
+
+## Accessing Census data on median household income
+
+```{r}
+#install.packages("cancensus")
+
+
+options(cancensus.api_key = "CensusMapper_f96486bcf9d8f024e333d216e279ea12",
+        cancensus.cache_path = "cache") # this sets a folder for your cache
+
+
+# get all regions at the 2016 Census (2020 not update yet)
+regions <- list_census_regions(dataset = "CA16")
+
+regions_filtered <-  regions %>% 
+  filter(level == "CSD") %>% # Figure out what CSD means in Census data
+  as_census_region_list()
+
+# This can take a while
+# We want to get household median income
+census_data_csd <- get_census(dataset='CA16', regions = regions_filtered,
+                          vectors=c("v_CA16_2397"), 
+                          level='CSD', geo_format = "sf")
+
+# Simplify to only needed variables
+median_income <- census_data_csd %>% 
+  as_tibble() %>% 
+  select(CSDuid = GeoUID, contains("median"), Population) %>% 
+  mutate(CSDuid = parse_number(CSDuid)) %>%
+  rename(hhld_median_inc = 2)
+```
+
+# Postal code conversion file
+```{r}
+#dataset = read_sav("data-raw/pccfNat_fccpNat_082021sav.sav")
+postcode = read_rds("data-raw/break_glass_in_case_of_emergency.Rds")
+write_rds(postcode,"data/postcode.Rds")
+```
+
+# Dataset Merging
+```{r}
+# Save the dataset 
+customer %>% left_join(postcode, by = c("postcode" = "PC")) %>% 
+  left_join(median_income, by = "CSDuid") %>% 
+  left_join(cust_dev, by = "cust_id") %>% 
+  write_rds("data/customer.Rds")
+cust_sleep %>% write_rds("data/cust_sleep.Rds")
+device_data %>% write_rds("data/device.Rds")
+```
+
+# Data Manipulation
+```{r}
+# Left join customer table with cust_dev with cust_id and left join device by dev_id
+customer_info = customer %>% left_join(cust_dev,by="cust_id") %>% left_join(device, by="dev_id")
+# Get the postcode income information
+postcode_inc = postcode %>% distinct(PC,.keep_all = TRUE) %>% left_join(median_income, by = "CSDuid")
+# Get rid of some unnecessary information in the customer_info
+customer_info = customer_info %>% left_join(postcode_inc, by = c("postcode" = "PC")) %>% select(-c(postcode, pronouns, dev_id, CSDuid)) 
+
+```
+
+```{r}
+# Remove NA only for sex and calculate the original
+customer_info = customer_info %>% 
+  filter(!is.na(sex)) %>% 
+  mutate(age = 
+           as.numeric(difftime(Sys.Date(), dob, units = "weeks")) / 52.25) %>%
+  select(-dob)
+
+
+# Age rescale: age = 0 represent min age, age = 1 represent max age
+customer_info = customer_info %>% mutate(rescaled_age = 0)
+customer_info$age_scale = scales::rescale(customer_info$age)
+# Population rescale: population = 0 represent min population, population = 1 represent max population
+customer_info = customer_info %>% mutate(rescaled_pop = 0)
+customer_info$population_scale = scales::rescale(customer_info$Population)
+# hhld_median_inc rescale: hhld_median_inc = 0 represent min hhld_median_inc, hhld_median_inc = 1 represent max hhld_median_inc
+customer_info = customer_info %>% mutate(rescaled_med_inc = 0)
+customer_info$hhld_median_inc_scale= scales::rescale(customer_info$hhld_median_inc)
+
+
+# Change emoji to a factor
+customer_info = customer_info %>% 
+  mutate(skin = case_when(emoji_modifier == "U+1F3FF" ~ "Dark",
+                          emoji_modifier == "U+1F3FE" ~ "Medium-dark",
+                          emoji_modifier == "U+1F3FD" ~ "Medium",
+                          emoji_modifier == "U+1F3FC" ~ "Medium-light",
+                          emoji_modifier == "U+1F3FB" ~ "Light", 
+                          is.na(emoji_modifier) ~ "Default")) %>% 
+  select(-emoji_modifier)
+
+# Convert character to factor
+customer_info = customer_info %>%
+  mutate(sex = as.factor(sex), 
+         device_name = as.factor(device_name),
+         line = as.factor(line),
+         skin = as.factor(skin))
+
+# Save datasets
+write_rds(customer_info, "data/customer.Rds")
+write_rds(cust_sleep, "data/cust_sleep.Rds")
+```
+
